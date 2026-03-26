@@ -14,6 +14,9 @@ pub struct GuvnorConfig {
     /// Config refresh interval in seconds
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_secs: u64,
+    /// If true, agent deregisters on shutdown (for ephemeral containers)
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 fn default_refresh_interval() -> u64 { 300 }

@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state_store = state::StateStore::open(&cfg.data_dir)?;
+    let guvnor_cfg = cfg.guvnor.clone();
     let pipeline = pipeline::Pipeline::new(cfg, state_store, metrics, analyzer);
     let shutdown = pipeline::shutdown_signal();
 
@@ -102,6 +103,14 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = result { error!(error = %e, "Pipeline error"); }
         }
         _ = shutdown => { info!("Shutdown signal received"); }
+    }
+
+    // Deregister if ephemeral mode
+    if let Some(ref guvnor_cfg) = guvnor_cfg {
+        if guvnor_cfg.ephemeral {
+            info!("Ephemeral mode: deregistering agent");
+            heartbeat::deregister(guvnor_cfg).await;
+        }
     }
 
     info!("Courier stopped");

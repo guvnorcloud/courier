@@ -5,6 +5,27 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
+pub async fn deregister(config: &GuvnorConfig) {
+    let client = reqwest::Client::new();
+    let url = format!("{}/courier/heartbeat", config.api_url);
+    let body = serde_json::json!({
+        "agent_id": config.agent_id,
+        "token": config.token,
+        "status": "deregistered",
+    });
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            info!("Agent deregistered");
+        }
+        Ok(resp) => {
+            warn!(status = %resp.status(), "Deregister failed");
+        }
+        Err(e) => {
+            warn!(error = %e, "Deregister failed");
+        }
+    }
+}
+
 pub struct HeartbeatMetrics {
     pub events_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
