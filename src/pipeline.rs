@@ -25,6 +25,19 @@ impl Pipeline {
 
     pub async fn run(self) -> anyhow::Result<()> {
         let (tx, mut buf) = buffer::create(self.config.buffer.memory_size);
+
+        // If no sources configured, hold the channel open and wait for shutdown.
+        // The agent stays alive to heartbeat and send discovery data.
+        if self.config.sources.is_empty() {
+            info!("No sources configured — running in discovery-only mode");
+            info!("Agent will heartbeat and await configuration via claim");
+            // Hold the sender so the channel stays open
+            let _keep_alive = tx;
+            // Just wait forever (shutdown_signal handles ctrl-c)
+            tokio::signal::ctrl_c().await.ok();
+            return Ok(());
+        }
+
         let _handles = sources::start_sources(&self.config.sources, tx, &self.state).await?;
         let sink = S3ParquetSink::new(self.config.sink.clone()).await?;
         let mut batch: Vec<LogEvent> = Vec::with_capacity(self.config.sink.batch.max_events);
@@ -35,7 +48,7 @@ impl Pipeline {
         let metrics = self.metrics.clone();
         let analyzer = self.analyzer;
 
-        info!("Pipeline running");
+        info!("Pipeline running with {} sources", self.config.sources.len());
         loop {
             tokio::select! {
                 event = buf.recv() => {
