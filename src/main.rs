@@ -6,6 +6,7 @@ mod buffer;
 mod config;
 mod discovery;
 mod heartbeat;
+mod intelligence;
 mod pipeline;
 mod sinks;
 mod sources;
@@ -55,8 +56,44 @@ async fn main() -> anyhow::Result<()> {
         info!(agent_id = %guvnor_cfg.agent_id, "Heartbeat started");
     }
 
+    // Initialize intelligence engine if configured
+    let analyzer = match cfg.intelligence.tier {
+        config::IntelligenceTier::Off => {
+            info!("Intelligence: off");
+            None
+        }
+        config::IntelligenceTier::Rules => {
+            info!("Intelligence: rules engine");
+            let handle = intelligence::analyzer::start(
+                cfg.intelligence.clone(),
+                None,
+                cfg.guvnor.as_ref().map(|g| g.api_url.clone()),
+                cfg.guvnor.as_ref().map(|g| g.agent_id.clone()),
+                cfg.guvnor.as_ref().map(|g| g.token.clone()),
+            ).await;
+            Some(handle)
+        }
+        config::IntelligenceTier::Llm => {
+            info!("Intelligence: LLM (BitNet)");
+            let resolved = intelligence::model_manager::ensure_model(
+                &cfg.data_dir,
+                &cfg.intelligence.model_repo,
+                &cfg.intelligence.model_file,
+            ).await?;
+            let engine = intelligence::engine::start(&cfg.intelligence, resolved.path).await?;
+            let handle = intelligence::analyzer::start(
+                cfg.intelligence.clone(),
+                Some(engine),
+                cfg.guvnor.as_ref().map(|g| g.api_url.clone()),
+                cfg.guvnor.as_ref().map(|g| g.agent_id.clone()),
+                cfg.guvnor.as_ref().map(|g| g.token.clone()),
+            ).await;
+            Some(handle)
+        }
+    };
+
     let state_store = state::StateStore::open(&cfg.data_dir)?;
-    let pipeline = pipeline::Pipeline::new(cfg, state_store, metrics);
+    let pipeline = pipeline::Pipeline::new(cfg, state_store, metrics, analyzer);
     let shutdown = pipeline::shutdown_signal();
 
     info!("Courier running");

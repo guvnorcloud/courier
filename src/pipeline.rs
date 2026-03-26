@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::heartbeat::HeartbeatMetrics;
+use crate::intelligence::analyzer::AnalyzerHandle;
 use crate::sources::{self, LogEvent};
 use crate::transforms;
 use crate::buffer;
@@ -14,11 +15,12 @@ pub struct Pipeline {
     config: Config,
     state: StateStore,
     metrics: Arc<HeartbeatMetrics>,
+    analyzer: Option<AnalyzerHandle>,
 }
 
 impl Pipeline {
-    pub fn new(config: Config, state: StateStore, metrics: Arc<HeartbeatMetrics>) -> Self {
-        Self { config, state, metrics }
+    pub fn new(config: Config, state: StateStore, metrics: Arc<HeartbeatMetrics>, analyzer: Option<AnalyzerHandle>) -> Self {
+        Self { config, state, metrics, analyzer }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -31,6 +33,7 @@ impl Pipeline {
         let transforms = self.config.transforms.clone();
         let mut tick = interval(Duration::from_secs(batch_cfg.timeout_secs));
         let metrics = self.metrics.clone();
+        let analyzer = self.analyzer;
 
         info!("Pipeline running");
         loop {
@@ -39,6 +42,8 @@ impl Pipeline {
                     match event {
                         Some(mut ev) => {
                             if !transforms::apply(&transforms, &mut ev) { continue; }
+                            // Feed to intelligence analyzer (non-blocking)
+                            if let Some(ref a) = analyzer { a.feed(&ev); }
                             batch_bytes += ev.message.len();
                             batch.push(ev);
                             if batch.len() >= batch_cfg.max_events || batch_bytes >= batch_cfg.max_bytes {

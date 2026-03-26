@@ -35,14 +35,29 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
-      - name: Build release binary
+      - name: Build release binary (standard)
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Package standard binary
         run: |
           cp target/${{ matrix.target }}/release/courier ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+
+      - name: Install cmake (for intelligence build)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build release binary (with intelligence)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --features intelligence --target ${{ matrix.target }}
+
+      - name: Package intelligence binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cp target/${{ matrix.target }}/release/courier ${{ matrix.artifact }}-smart
+          chmod +x ${{ matrix.artifact }}-smart
+          sha256sum ${{ matrix.artifact }}-smart > ${{ matrix.artifact }}-smart.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -51,6 +66,8 @@ jobs:
           path: |
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.sha256
+            ${{ matrix.artifact }}-smart
+            ${{ matrix.artifact }}-smart.sha256
 
   release:
     needs: build
@@ -66,6 +83,8 @@ jobs:
           files: |
             courier-linux-x86_64
             courier-linux-x86_64.sha256
+            courier-linux-x86_64-smart
+            courier-linux-x86_64-smart.sha256
             courier-linux-aarch64
             courier-linux-aarch64.sha256
           generate_release_notes: true

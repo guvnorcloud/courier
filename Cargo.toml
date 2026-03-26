@@ -32,3 +32,15 @@ zstd = "0.13"
 anyhow = "1"
 async-trait = "0.1"
 gethostname = "0.5"
+sha2 = "0.10"
+hex = "0.4"
+tokio-util = "0.7"
+futures = "0.3"
+
+[features]
+default = []
+intelligence = ["dep:bitnet-llm"]
+
+[dependencies.bitnet-llm]
+version = "1"
+optional = true

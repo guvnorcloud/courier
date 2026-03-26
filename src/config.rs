@@ -31,6 +31,102 @@ pub struct Config {
     pub buffer: BufferConfig,
     #[serde(default)]
     pub guvnor: Option<GuvnorConfig>,
+    #[serde(default)]
+    pub intelligence: IntelligenceConfig,
+}
+
+/// Intelligence tier — controls how logs are analyzed on-agent
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum IntelligenceTier {
+    /// No analysis — just forward logs
+    Off,
+    /// Rule-based: regex patterns, thresholds, keyword matching
+    Rules,
+    /// LLM-powered: BitNet 1.58-bit model runs on CPU
+    Llm,
+}
+
+impl Default for IntelligenceTier {
+    fn default() -> Self { Self::Off }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntelligenceConfig {
+    #[serde(default)]
+    pub tier: IntelligenceTier,
+
+    /// Model ID on HuggingFace (default: microsoft/bitnet-b1.58-2B-4T-gguf)
+    #[serde(default = "default_model_repo")]
+    pub model_repo: String,
+
+    /// GGUF filename within the repo
+    #[serde(default = "default_model_file")]
+    pub model_file: String,
+
+    /// Max RAM budget for the model in MB (default: 512)
+    #[serde(default = "default_model_max_ram_mb")]
+    pub max_ram_mb: usize,
+
+    /// How many log lines to batch before running analysis
+    #[serde(default = "default_analysis_batch")]
+    pub batch_size: usize,
+
+    /// Max tokens the model generates per analysis
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+
+    /// Severity threshold to report findings (0.0 - 1.0)
+    #[serde(default = "default_severity_threshold")]
+    pub severity_threshold: f32,
+
+    /// Categories to watch for
+    #[serde(default = "default_categories")]
+    pub categories: Vec<String>,
+
+    /// Custom rules for the rules tier
+    #[serde(default)]
+    pub rules: Vec<IntelligenceRule>,
+}
+
+impl Default for IntelligenceConfig {
+    fn default() -> Self {
+        Self {
+            tier: IntelligenceTier::Off,
+            model_repo: default_model_repo(),
+            model_file: default_model_file(),
+            max_ram_mb: default_model_max_ram_mb(),
+            batch_size: default_analysis_batch(),
+            max_tokens: default_max_tokens(),
+            severity_threshold: default_severity_threshold(),
+            categories: default_categories(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntelligenceRule {
+    pub name: String,
+    pub pattern: String,
+    pub severity: String, // critical, high, medium, low, info
+    pub category: String,
+    pub description: String,
+}
+
+fn default_model_repo() -> String { "microsoft/bitnet-b1.58-2B-4T-gguf".into() }
+fn default_model_file() -> String { "bitnet-b1.58-2B-4T-gguf-Q4_K_M.gguf".into() }
+fn default_model_max_ram_mb() -> usize { 512 }
+fn default_analysis_batch() -> usize { 50 }
+fn default_max_tokens() -> usize { 256 }
+fn default_severity_threshold() -> f32 { 0.3 }
+fn default_categories() -> Vec<String> {
+    vec![
+        "security".into(),
+        "error".into(),
+        "anomaly".into(),
+        "performance".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
