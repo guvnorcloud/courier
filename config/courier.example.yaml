@@ -1,0 +1,35 @@
+data_dir: /var/lib/courier
+
+sources:
+  app_logs:
+    type: file
+    include:
+      - /var/log/app/*.log
+      - /var/log/syslog
+    exclude:
+      - "*.gz"
+
+transforms:
+  - type: filter
+    exclude: 'DEBUG|TRACE'
+  - type: parse
+    format: json
+  - type: mask
+    fields:
+      - pattern: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        replacement: '***EMAIL***'
+      - pattern: '\b\d{3}-\d{2}-\d{4}\b'
+        replacement: '***SSN***'
+
+sink:
+  bucket: guvnor-logs-prod
+  key_prefix: 'logs/{org_id}/{source}/{date}/{hour}/'
+  region: us-east-1
+  compression: zstd
+  batch:
+    max_bytes: 5242880
+    max_events: 10000
+    timeout_secs: 10
+
+buffer:
+  memory_size: 10000
