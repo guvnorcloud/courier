@@ -108,10 +108,16 @@ fn inference_loop(
     config: &IntelligenceConfig,
     model_path: &std::path::Path,
 ) {
-    use bitnet_llm::{Model, SessionConfig};
+    use bitnet_llm::{Model, ModelParams};
+
+    let params = ModelParams {
+        n_ctx: 2048,
+        n_threads: 2,
+        ..Default::default()
+    };
 
     // Load the model
-    let model = match Model::load(model_path) {
+    let model = match Model::load(model_path, params) {
         Ok(m) => {
             info!("BitNet model loaded successfully");
             m
@@ -122,12 +128,11 @@ fn inference_loop(
         }
     };
 
-    let session_config = SessionConfig::default()
-        .with_max_tokens(config.max_tokens);
+    let max_tokens = config.max_tokens;
 
     // Process requests
     while let Some(req) = rx.blocking_recv() {
-        let findings = analyze_batch(&model, &session_config, &req, config);
+        let findings = analyze_batch(&model, max_tokens, &req, config);
         let _ = req.respond.send(findings);
     }
 
@@ -152,18 +157,21 @@ fn inference_loop(
 #[cfg(feature = "intelligence")]
 fn analyze_batch(
     model: &bitnet_llm::Model,
-    session_config: &bitnet_llm::SessionConfig,
+    max_tokens: usize,
     req: &AnalysisRequest,
     config: &IntelligenceConfig,
 ) -> Vec<Finding> {
+    use tracing::debug;
+
     let prompt = build_prompt(&req.lines, &req.source, &config.categories);
     debug!(lines = req.lines.len(), prompt_len = prompt.len(), "Analyzing batch");
 
-    let mut session = model.create_session(session_config.clone());
-    match session.generate(&prompt) {
+    let mut session = model.session();
+    match session.generate(&prompt, max_tokens) {
         Ok(response) => {
-            debug!(response_len = response.len(), "Model response received");
-            parse_findings(&response, req, config)
+            let text = response.to_string();
+            debug!(response_len = text.len(), "Model response received");
+            parse_findings(&text, req, config)
         }
         Err(e) => {
             error!(error = %e, "Inference failed");
