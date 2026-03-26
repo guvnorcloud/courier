@@ -4,6 +4,7 @@ use tracing::{error, info};
 
 mod buffer;
 mod config;
+mod heartbeat;
 mod pipeline;
 mod sinks;
 mod sources;
@@ -38,8 +39,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Start heartbeat if Guvnor config is present
+    let metrics = heartbeat::HeartbeatMetrics::new();
+    let start_time = std::time::Instant::now();
+    if let Some(guvnor_cfg) = &cfg.guvnor {
+        heartbeat::start_heartbeat(guvnor_cfg.clone(), metrics.clone(), start_time).await;
+        info!(agent_id = %guvnor_cfg.agent_id, "Heartbeat started");
+    }
+
     let state_store = state::StateStore::open(&cfg.data_dir)?;
-    let pipeline = pipeline::Pipeline::new(cfg, state_store);
+    let pipeline = pipeline::Pipeline::new(cfg, state_store, metrics);
     let shutdown = pipeline::shutdown_signal();
 
     info!("Courier running");

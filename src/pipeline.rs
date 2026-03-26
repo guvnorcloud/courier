@@ -1,16 +1,25 @@
 use crate::config::Config;
+use crate::heartbeat::HeartbeatMetrics;
 use crate::sources::{self, LogEvent};
 use crate::transforms;
 use crate::buffer;
 use crate::sinks::s3_parquet::S3ParquetSink;
 use crate::state::StateStore;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{info, error, debug};
 
-pub struct Pipeline { config: Config, state: StateStore }
+pub struct Pipeline {
+    config: Config,
+    state: StateStore,
+    metrics: Arc<HeartbeatMetrics>,
+}
 
 impl Pipeline {
-    pub fn new(config: Config, state: StateStore) -> Self { Self { config, state } }
+    pub fn new(config: Config, state: StateStore, metrics: Arc<HeartbeatMetrics>) -> Self {
+        Self { config, state, metrics }
+    }
 
     pub async fn run(self) -> anyhow::Result<()> {
         let (tx, mut buf) = buffer::create(self.config.buffer.memory_size);
@@ -21,6 +30,7 @@ impl Pipeline {
         let batch_cfg = self.config.sink.batch.clone();
         let transforms = self.config.transforms.clone();
         let mut tick = interval(Duration::from_secs(batch_cfg.timeout_secs));
+        let metrics = self.metrics.clone();
 
         info!("Pipeline running");
         loop {
@@ -32,16 +42,16 @@ impl Pipeline {
                             batch_bytes += ev.message.len();
                             batch.push(ev);
                             if batch.len() >= batch_cfg.max_events || batch_bytes >= batch_cfg.max_bytes {
-                                flush(&sink, &mut batch, &mut batch_bytes).await;
+                                flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
                             }
                         }
-                        None => { flush(&sink, &mut batch, &mut batch_bytes).await; break; }
+                        None => { flush(&sink, &mut batch, &mut batch_bytes, &metrics).await; break; }
                     }
                 }
                 _ = tick.tick() => {
                     if !batch.is_empty() {
                         debug!(events = batch.len(), "Timer flush");
-                        flush(&sink, &mut batch, &mut batch_bytes).await;
+                        flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
                     }
                 }
             }
@@ -50,11 +60,23 @@ impl Pipeline {
     }
 }
 
-async fn flush(sink: &S3ParquetSink, batch: &mut Vec<LogEvent>, bytes: &mut usize) {
+async fn flush(
+    sink: &S3ParquetSink,
+    batch: &mut Vec<LogEvent>,
+    bytes: &mut usize,
+    metrics: &Arc<HeartbeatMetrics>,
+) {
     if batch.is_empty() { return; }
+    let count = batch.len();
+    let byte_count = *bytes;
     let events = std::mem::take(batch);
     *bytes = 0;
-    if let Err(e) = sink.write_batch(events).await { error!(error = %e, "Flush failed"); }
+    if let Err(e) = sink.write_batch(events).await {
+        error!(error = %e, "Flush failed");
+    } else {
+        metrics.events_sent.fetch_add(count as u64, Ordering::Relaxed);
+        metrics.bytes_sent.fetch_add(byte_count as u64, Ordering::Relaxed);
+    }
 }
 
 pub async fn shutdown_signal() {
