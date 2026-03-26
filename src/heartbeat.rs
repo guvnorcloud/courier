@@ -1,4 +1,5 @@
 use crate::config::GuvnorConfig;
+use crate::discovery::HostDiscovery;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -22,15 +23,18 @@ pub async fn start_heartbeat(
     guvnor: GuvnorConfig,
     metrics: Arc<HeartbeatMetrics>,
     start_time: std::time::Instant,
+    discovery: Option<HostDiscovery>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut tick = interval(Duration::from_secs(30));
+        let mut first_beat = true;
+        let discovery_data = discovery;
 
         loop {
             tick.tick().await;
 
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "agent_id": guvnor.agent_id,
                 "token": guvnor.token,
                 "hostname": gethostname::gethostname().to_string_lossy().to_string(),
@@ -40,6 +44,16 @@ pub async fn start_heartbeat(
                 "uptime_secs": start_time.elapsed().as_secs(),
                 "version": env!("CARGO_PKG_VERSION"),
             });
+
+            // Include discovery data on the first heartbeat
+            if first_beat {
+                if let Some(ref disc) = discovery_data {
+                    if let Ok(disc_val) = serde_json::to_value(disc) {
+                        body.as_object_mut().unwrap().insert("discovery".to_string(), disc_val);
+                    }
+                }
+                first_beat = false;
+            }
 
             match client
                 .post(format!("{}/api/v1/courier/heartbeat", guvnor.api_url))
@@ -56,8 +70,16 @@ pub async fn start_heartbeat(
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false)
                             {
-                                info!("Config update available — will reload on next cycle");
+                                info!("Config update available -- will reload on next cycle");
                                 // TODO: trigger config reload
+                            }
+                            // If server requests discovery re-send
+                            if data
+                                .get("send_discovery")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                first_beat = true;
                             }
                         }
                         debug!("Heartbeat sent");

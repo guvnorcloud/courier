@@ -4,6 +4,7 @@ use tracing::{error, info};
 
 mod buffer;
 mod config;
+mod discovery;
 mod heartbeat;
 mod pipeline;
 mod sinks;
@@ -39,11 +40,18 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Start heartbeat if Guvnor config is present
+    // Run host discovery and start heartbeat if Guvnor config is present
     let metrics = heartbeat::HeartbeatMetrics::new();
     let start_time = std::time::Instant::now();
     if let Some(guvnor_cfg) = &cfg.guvnor {
-        heartbeat::start_heartbeat(guvnor_cfg.clone(), metrics.clone(), start_time).await;
+        let discovery_data = discovery::discover();
+        info!(
+            processes = discovery_data.processes.len(),
+            log_dirs = discovery_data.log_dirs.len(),
+            recommendations = discovery_data.recommendations.len(),
+            "Host discovery complete"
+        );
+        heartbeat::start_heartbeat(guvnor_cfg.clone(), metrics.clone(), start_time, Some(discovery_data)).await;
         info!(agent_id = %guvnor_cfg.agent_id, "Heartbeat started");
     }
 
