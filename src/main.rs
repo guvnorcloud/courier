@@ -202,10 +202,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Reset the watch channel for next cycle
+        // Reset the watch channel for next cycle — consume the current value
+        // so rx.changed() doesn't fire immediately on the next pipeline run
         if let Some(ref mut rx) = reload_rx {
-            // Mark as seen so we don't immediately re-trigger
-            rx.mark_changed();
+            let _ = rx.borrow_and_update();
         }
     }
 }
