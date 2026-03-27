@@ -2,12 +2,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub children: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostDiscovery {
     pub hostname: String,
     pub os: String,
     pub arch: String,
     pub processes: Vec<DetectedProcess>,
-    pub log_dirs: Vec<DiscoveredLogDir>,
+    pub file_tree: Vec<FileEntry>,
     pub recommendations: Vec<LogRecommendation>,
 }
 
@@ -16,14 +26,6 @@ pub struct DetectedProcess {
     pub name: String,
     pub pid: u32,
     pub cmdline: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveredLogDir {
-    pub path: String,
-    pub file_count: usize,
-    pub total_bytes: u64,
-    pub newest_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,21 +58,32 @@ const SERVICE_LOG_MAP: &[(&str, &str, &[&str], &str)] = &[
     ("systemd-journald", "System journal", &["/var/log/syslog", "/var/log/messages"], "regex"),
 ];
 
+const SCAN_ROOTS: &[&str] = &[
+    "/var/log",
+    "/var/log/journal",
+    "/opt",
+    "/home",
+    "/tmp",
+];
+
+const MAX_DEPTH: usize = 3;
+const MAX_ENTRIES: usize = 500;
+
 pub fn discover() -> HostDiscovery {
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
 
     let processes = detect_processes();
-    let log_dirs = scan_log_directories();
-    let recommendations = generate_recommendations(&processes, &log_dirs);
+    let file_tree = scan_file_tree();
+    let recommendations = generate_recommendations(&processes, &file_tree);
 
     HostDiscovery {
         hostname,
         os,
         arch,
         processes,
-        log_dirs,
+        file_tree,
         recommendations,
     }
 }
@@ -108,69 +121,151 @@ fn detect_processes() -> Vec<DetectedProcess> {
     procs
 }
 
-fn scan_log_directories() -> Vec<DiscoveredLogDir> {
-    let dirs_to_scan = [
-        "/var/log",
-        "/var/log/nginx",
-        "/var/log/apache2",
-        "/var/log/httpd",
-        "/var/log/postgresql",
-        "/var/log/mysql",
-        "/var/log/mongodb",
-        "/var/log/redis",
-        "/var/log/app",
-        "/tmp",
-    ];
+/// Recursively scan directories to build a file tree for the UI file browser.
+/// Max depth of 3, max 500 total entries. Skips symlinks and unreadable dirs.
+fn scan_file_tree() -> Vec<FileEntry> {
+    let mut total_count: usize = 0;
+    let mut tree = Vec::new();
 
-    let mut results = Vec::new();
-    for dir in &dirs_to_scan {
-        let path = std::path::Path::new(dir);
+    for root in SCAN_ROOTS {
+        if total_count >= MAX_ENTRIES {
+            break;
+        }
+        let path = std::path::Path::new(root);
         if !path.exists() || !path.is_dir() {
             continue;
         }
-
-        let mut file_count = 0usize;
-        let mut total_bytes = 0u64;
-        let mut newest: Option<(String, std::time::SystemTime)> = None;
-
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        file_count += 1;
-                        total_bytes += meta.len();
-                        if let Ok(modified) = meta.modified() {
-                            if newest.as_ref().map_or(true, |(_, t)| modified > *t) {
-                                newest = Some((
-                                    entry.path().to_string_lossy().to_string(),
-                                    modified,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
+        // Skip symlinks at root level to avoid loops
+        if path.symlink_metadata().map_or(true, |m| m.file_type().is_symlink()) {
+            continue;
         }
-
-        if file_count > 0 {
-            results.push(DiscoveredLogDir {
-                path: dir.to_string(),
-                file_count,
-                total_bytes,
-                newest_file: newest.map(|(p, _)| p),
-            });
+        if let Some(entry) = scan_dir_recursive(path, 0, &mut total_count) {
+            tree.push(entry);
         }
     }
 
-    results
+    tree
+}
+
+fn scan_dir_recursive(
+    dir: &std::path::Path,
+    depth: usize,
+    total_count: &mut usize,
+) -> Option<FileEntry> {
+    if *total_count >= MAX_ENTRIES {
+        return None;
+    }
+    *total_count += 1;
+
+    let modified = dir
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| {
+                    chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                })
+        });
+
+    let mut children = Vec::new();
+
+    if depth < MAX_DEPTH {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut entries_vec: Vec<_> = entries.flatten().collect();
+            // Sort for deterministic output
+            entries_vec.sort_by_key(|e| e.file_name());
+
+            for entry in entries_vec {
+                if *total_count >= MAX_ENTRIES {
+                    break;
+                }
+
+                let path = entry.path();
+
+                // Skip symlinks to avoid loops
+                if let Ok(meta) = entry.metadata() {
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                // Also check symlink_metadata for the entry itself
+                if let Ok(sym_meta) = std::fs::symlink_metadata(&path) {
+                    if sym_meta.file_type().is_symlink() {
+                        continue;
+                    }
+                }
+
+                if path.is_dir() {
+                    if let Some(child) = scan_dir_recursive(&path, depth + 1, total_count) {
+                        children.push(child);
+                    }
+                } else if path.is_file() {
+                    if *total_count >= MAX_ENTRIES {
+                        break;
+                    }
+                    *total_count += 1;
+
+                    let file_meta = std::fs::metadata(&path).ok();
+                    let size = file_meta.as_ref().map_or(0, |m| m.len());
+                    let file_modified = file_meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| {
+                            t.duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| {
+                                    chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                                        .map(|dt| dt.to_rfc3339())
+                                        .unwrap_or_default()
+                                })
+                        });
+
+                    children.push(FileEntry {
+                        path: path.to_string_lossy().to_string(),
+                        is_dir: false,
+                        size,
+                        modified: file_modified,
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    Some(FileEntry {
+        path: dir.to_string_lossy().to_string(),
+        is_dir: true,
+        size: 0,
+        modified,
+        children,
+    })
 }
 
 fn generate_recommendations(
     processes: &[DetectedProcess],
-    log_dirs: &[DiscoveredLogDir],
+    file_tree: &[FileEntry],
 ) -> Vec<LogRecommendation> {
     let mut recs = Vec::new();
-    let available_dirs: HashSet<&str> = log_dirs.iter().map(|d| d.path.as_str()).collect();
+
+    // Build a set of all directories found in the file tree
+    let mut available_dirs: HashSet<String> = HashSet::new();
+    fn collect_dirs(entry: &FileEntry, dirs: &mut HashSet<String>) {
+        if entry.is_dir {
+            dirs.insert(entry.path.clone());
+        }
+        for child in &entry.children {
+            collect_dirs(child, dirs);
+        }
+    }
+    for root in file_tree {
+        collect_dirs(root, &mut available_dirs);
+    }
 
     for (proc_name, desc, paths, format) in SERVICE_LOG_MAP {
         // Check if this process is running
@@ -188,7 +283,7 @@ fn generate_recommendations(
                     .parent()
                     .map(|pa| pa.to_string_lossy().to_string());
                 parent.map_or(false, |d| {
-                    available_dirs.contains(d.as_str()) || std::path::Path::new(&d).exists()
+                    available_dirs.contains(&d) || std::path::Path::new(&d).exists()
                 })
             })
             .map(|p| p.to_string())

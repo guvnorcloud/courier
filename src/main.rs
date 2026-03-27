@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod buffer;
 mod config;
@@ -44,75 +44,165 @@ async fn main() -> anyhow::Result<()> {
     // Run host discovery and start heartbeat if Guvnor config is present
     let metrics = heartbeat::HeartbeatMetrics::new();
     let start_time = std::time::Instant::now();
-    if let Some(guvnor_cfg) = &cfg.guvnor {
+
+    let config_reload_rx = if let Some(guvnor_cfg) = &cfg.guvnor {
         let discovery_data = discovery::discover();
         info!(
             processes = discovery_data.processes.len(),
-            log_dirs = discovery_data.log_dirs.len(),
+            file_tree_roots = discovery_data.file_tree.len(),
             recommendations = discovery_data.recommendations.len(),
             "Host discovery complete"
         );
-        heartbeat::start_heartbeat(guvnor_cfg.clone(), metrics.clone(), start_time, Some(discovery_data)).await;
+        let (_hb_handle, rx) = heartbeat::start_heartbeat(
+            guvnor_cfg.clone(),
+            metrics.clone(),
+            start_time,
+            Some(discovery_data),
+        ).await;
         info!(agent_id = %guvnor_cfg.agent_id, "Heartbeat started");
-    }
-
-    // Initialize intelligence engine if configured
-    let analyzer = match cfg.intelligence.tier {
-        config::IntelligenceTier::Off => {
-            info!("Intelligence: off");
-            None
-        }
-        config::IntelligenceTier::Rules => {
-            info!("Intelligence: rules engine");
-            let handle = intelligence::analyzer::start(
-                cfg.intelligence.clone(),
-                None,
-                cfg.guvnor.as_ref().map(|g| g.api_url.clone()),
-                cfg.guvnor.as_ref().map(|g| g.agent_id.clone()),
-                cfg.guvnor.as_ref().map(|g| g.token.clone()),
-            ).await;
-            Some(handle)
-        }
-        config::IntelligenceTier::Llm => {
-            info!("Intelligence: LLM (BitNet)");
-            let resolved = intelligence::model_manager::ensure_model(
-                &cfg.data_dir,
-                &cfg.intelligence.model_repo,
-                &cfg.intelligence.model_file,
-            ).await?;
-            let engine = intelligence::engine::start(&cfg.intelligence, resolved.path).await?;
-            let handle = intelligence::analyzer::start(
-                cfg.intelligence.clone(),
-                Some(engine),
-                cfg.guvnor.as_ref().map(|g| g.api_url.clone()),
-                cfg.guvnor.as_ref().map(|g| g.agent_id.clone()),
-                cfg.guvnor.as_ref().map(|g| g.token.clone()),
-            ).await;
-            Some(handle)
-        }
+        Some(rx)
+    } else {
+        None
     };
 
-    let state_store = state::StateStore::open(&cfg.data_dir)?;
-    let guvnor_cfg = cfg.guvnor.clone();
-    let pipeline = pipeline::Pipeline::new(cfg, state_store, metrics, analyzer);
-    let shutdown = pipeline::shutdown_signal();
+    // Main config reload loop
+    let mut current_cfg = cfg;
+    let mut reload_rx = config_reload_rx;
 
-    info!("Courier running");
-    tokio::select! {
-        result = pipeline.run() => {
-            if let Err(e) = result { error!(error = %e, "Pipeline error"); }
+    loop {
+        // Initialize intelligence engine for this config cycle
+        let analyzer = match current_cfg.intelligence.tier {
+            config::IntelligenceTier::Off => {
+                info!("Intelligence: off");
+                None
+            }
+            config::IntelligenceTier::Rules => {
+                info!("Intelligence: rules engine");
+                let handle = intelligence::analyzer::start(
+                    current_cfg.intelligence.clone(),
+                    None,
+                    current_cfg.guvnor.as_ref().map(|g| g.api_url.clone()),
+                    current_cfg.guvnor.as_ref().map(|g| g.agent_id.clone()),
+                    current_cfg.guvnor.as_ref().map(|g| g.token.clone()),
+                ).await;
+                Some(handle)
+            }
+            config::IntelligenceTier::Llm => {
+                info!("Intelligence: LLM (BitNet)");
+                let resolved = intelligence::model_manager::ensure_model(
+                    &current_cfg.data_dir,
+                    &current_cfg.intelligence.model_repo,
+                    &current_cfg.intelligence.model_file,
+                ).await?;
+                let engine = intelligence::engine::start(&current_cfg.intelligence, resolved.path).await?;
+                let handle = intelligence::analyzer::start(
+                    current_cfg.intelligence.clone(),
+                    Some(engine),
+                    current_cfg.guvnor.as_ref().map(|g| g.api_url.clone()),
+                    current_cfg.guvnor.as_ref().map(|g| g.agent_id.clone()),
+                    current_cfg.guvnor.as_ref().map(|g| g.token.clone()),
+                ).await;
+                Some(handle)
+            }
+        };
+
+        let state_store = state::StateStore::open(&current_cfg.data_dir)?;
+        let guvnor_cfg = current_cfg.guvnor.clone();
+
+        let mut pipeline = pipeline::Pipeline::new(
+            current_cfg.clone(),
+            state_store,
+            metrics.clone(),
+            analyzer,
+        );
+
+        if let Some(rx) = reload_rx.take() {
+            pipeline = pipeline.with_config_reload(rx.clone());
+            reload_rx = Some(rx);
         }
-        _ = shutdown => { info!("Shutdown signal received"); }
-    }
 
-    // Deregister if ephemeral mode
-    if let Some(ref guvnor_cfg) = guvnor_cfg {
-        if guvnor_cfg.ephemeral {
-            info!("Ephemeral mode: deregistering agent");
-            heartbeat::deregister(guvnor_cfg).await;
+        info!("Courier running");
+
+        let shutdown = pipeline::shutdown_signal();
+
+        let should_reload = tokio::select! {
+            result = pipeline.run() => {
+                match result {
+                    Ok(true) => true,   // config reload requested
+                    Ok(false) => false, // normal exit
+                    Err(e) => {
+                        error!(error = %e, "Pipeline error");
+                        false
+                    }
+                }
+            }
+            _ = shutdown => {
+                info!("Shutdown signal received");
+                false
+            }
+        };
+
+        if !should_reload {
+            // Deregister if ephemeral mode
+            if let Some(ref guvnor_cfg) = guvnor_cfg {
+                if guvnor_cfg.ephemeral {
+                    info!("Ephemeral mode: deregistering agent");
+                    heartbeat::deregister(guvnor_cfg).await;
+                }
+            }
+            info!("Courier stopped");
+            return Ok(());
+        }
+
+        // Config reload: fetch new config from bootstrap endpoint and save to disk
+        info!("Config reload triggered — fetching updated config");
+
+        if let Some(ref guvnor) = guvnor_cfg {
+            match config::load_remote(&guvnor.api_url, &guvnor.token, &guvnor.agent_id).await {
+                Ok(new_cfg) => {
+                    // Write updated config to disk so it persists across restarts
+                    match serde_yaml::to_string(&new_cfg) {
+                        Ok(yaml) => {
+                            if let Err(e) = std::fs::write(&cli.config, &yaml) {
+                                warn!(error = %e, "Failed to write updated config to disk");
+                            } else {
+                                info!(path = %cli.config.display(), "Updated config saved to disk");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to serialize updated config");
+                        }
+                    }
+                    current_cfg = new_cfg;
+                    info!("Config reloaded — restarting pipeline");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch updated config — retrying with current config");
+                    // Re-load from disk as fallback
+                    match config::load(&cli.config) {
+                        Ok(cfg) => { current_cfg = cfg; }
+                        Err(e) => {
+                            error!(error = %e, "Failed to reload config from disk — exiting");
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        } else {
+            // No guvnor config means no remote reload, just re-read from disk
+            match config::load(&cli.config) {
+                Ok(cfg) => { current_cfg = cfg; }
+                Err(e) => {
+                    error!(error = %e, "Failed to reload config from disk — exiting");
+                    return Err(e);
+                }
+            }
+        }
+
+        // Reset the watch channel for next cycle
+        if let Some(ref mut rx) = reload_rx {
+            // Mark as seen so we don't immediately re-trigger
+            rx.mark_changed();
         }
     }
-
-    info!("Courier stopped");
-    Ok(())
 }

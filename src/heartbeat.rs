@@ -2,6 +2,7 @@ use crate::config::GuvnorConfig;
 use crate::discovery::HostDiscovery;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
@@ -40,13 +41,17 @@ impl HeartbeatMetrics {
     }
 }
 
+/// Start the heartbeat loop. Returns a join handle and a watch receiver
+/// that signals `true` when the backend reports config_updated.
 pub async fn start_heartbeat(
     guvnor: GuvnorConfig,
     metrics: Arc<HeartbeatMetrics>,
     start_time: std::time::Instant,
     discovery: Option<HostDiscovery>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
+    let (config_tx, config_rx) = watch::channel(false);
+
+    let handle = tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut tick = interval(Duration::from_secs(30));
         let mut first_beat = true;
@@ -91,8 +96,8 @@ pub async fn start_heartbeat(
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false)
                             {
-                                info!("Config update available -- will reload on next cycle");
-                                // TODO: trigger config reload
+                                info!("Config update available — signaling reload");
+                                let _ = config_tx.send(true);
                             }
                             // If server requests discovery re-send
                             if data
@@ -111,5 +116,7 @@ pub async fn start_heartbeat(
                 Err(e) => warn!(error = %e, "Heartbeat error"),
             }
         }
-    })
+    });
+
+    (handle, config_rx)
 }

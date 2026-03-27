@@ -8,6 +8,7 @@ use crate::sinks::s3_parquet::S3ParquetSink;
 use crate::state::StateStore;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::time::{interval, Duration};
 use tracing::{info, error, debug};
 
@@ -16,26 +17,50 @@ pub struct Pipeline {
     state: StateStore,
     metrics: Arc<HeartbeatMetrics>,
     analyzer: Option<AnalyzerHandle>,
+    config_reload_rx: Option<watch::Receiver<bool>>,
 }
 
 impl Pipeline {
-    pub fn new(config: Config, state: StateStore, metrics: Arc<HeartbeatMetrics>, analyzer: Option<AnalyzerHandle>) -> Self {
-        Self { config, state, metrics, analyzer }
+    pub fn new(
+        config: Config,
+        state: StateStore,
+        metrics: Arc<HeartbeatMetrics>,
+        analyzer: Option<AnalyzerHandle>,
+    ) -> Self {
+        Self { config, state, metrics, analyzer, config_reload_rx: None }
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub fn with_config_reload(mut self, rx: watch::Receiver<bool>) -> Self {
+        self.config_reload_rx = Some(rx);
+        self
+    }
+
+    /// Run the pipeline. Returns Ok(true) if a config reload was requested,
+    /// Ok(false) for normal shutdown.
+    pub async fn run(mut self) -> anyhow::Result<bool> {
         let (tx, mut buf) = buffer::create(self.config.buffer.memory_size);
 
-        // If no sources configured, hold the channel open and wait for shutdown.
-        // The agent stays alive to heartbeat and send discovery data.
+        // If no sources configured, hold the channel open and wait for shutdown or config reload.
         if self.config.sources.is_empty() {
             info!("No sources configured — running in discovery-only mode");
             info!("Agent will heartbeat and await configuration via claim");
-            // Hold the sender so the channel stays open
             let _keep_alive = tx;
-            // Just wait forever (shutdown_signal handles ctrl-c)
-            tokio::signal::ctrl_c().await.ok();
-            return Ok(());
+
+            if let Some(ref mut rx) = self.config_reload_rx {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => { return Ok(false); }
+                    result = rx.changed() => {
+                        if result.is_ok() && *rx.borrow() {
+                            info!("Config reload signal received in discovery-only mode");
+                            return Ok(true);
+                        }
+                        return Ok(false);
+                    }
+                }
+            } else {
+                tokio::signal::ctrl_c().await.ok();
+                return Ok(false);
+            }
         }
 
         let _handles = sources::start_sources(&self.config.sources, tx, &self.state).await?;
@@ -49,32 +74,67 @@ impl Pipeline {
         let analyzer = self.analyzer;
 
         info!("Pipeline running with {} sources", self.config.sources.len());
-        loop {
-            tokio::select! {
-                event = buf.recv() => {
-                    match event {
-                        Some(mut ev) => {
-                            if !transforms::apply(&transforms, &mut ev) { continue; }
-                            // Feed to intelligence analyzer (non-blocking)
-                            if let Some(ref a) = analyzer { a.feed(&ev); }
-                            batch_bytes += ev.message.len();
-                            batch.push(ev);
-                            if batch.len() >= batch_cfg.max_events || batch_bytes >= batch_cfg.max_bytes {
-                                flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+
+        // If we have a config reload receiver, include it in the select loop
+        if let Some(ref mut rx) = self.config_reload_rx {
+            loop {
+                tokio::select! {
+                    event = buf.recv() => {
+                        match event {
+                            Some(mut ev) => {
+                                if !transforms::apply(&transforms, &mut ev) { continue; }
+                                if let Some(ref a) = analyzer { a.feed(&ev); }
+                                batch_bytes += ev.message.len();
+                                batch.push(ev);
+                                if batch.len() >= batch_cfg.max_events || batch_bytes >= batch_cfg.max_bytes {
+                                    flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+                                }
                             }
+                            None => { flush(&sink, &mut batch, &mut batch_bytes, &metrics).await; return Ok(false); }
                         }
-                        None => { flush(&sink, &mut batch, &mut batch_bytes, &metrics).await; break; }
+                    }
+                    _ = tick.tick() => {
+                        if !batch.is_empty() {
+                            debug!(events = batch.len(), "Timer flush");
+                            flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+                        }
+                    }
+                    result = rx.changed() => {
+                        if result.is_ok() && *rx.borrow() {
+                            // Flush remaining events before reloading
+                            flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+                            info!("Config reload signal received — restarting pipeline");
+                            return Ok(true);
+                        }
                     }
                 }
-                _ = tick.tick() => {
-                    if !batch.is_empty() {
-                        debug!(events = batch.len(), "Timer flush");
-                        flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+            }
+        } else {
+            loop {
+                tokio::select! {
+                    event = buf.recv() => {
+                        match event {
+                            Some(mut ev) => {
+                                if !transforms::apply(&transforms, &mut ev) { continue; }
+                                if let Some(ref a) = analyzer { a.feed(&ev); }
+                                batch_bytes += ev.message.len();
+                                batch.push(ev);
+                                if batch.len() >= batch_cfg.max_events || batch_bytes >= batch_cfg.max_bytes {
+                                    flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+                                }
+                            }
+                            None => { flush(&sink, &mut batch, &mut batch_bytes, &metrics).await; return Ok(false); }
+                        }
+                    }
+                    _ = tick.tick() => {
+                        if !batch.is_empty() {
+                            debug!(events = batch.len(), "Timer flush");
+                            flush(&sink, &mut batch, &mut batch_bytes, &metrics).await;
+                        }
                     }
                 }
             }
         }
-        Ok(())
     }
 }
 
