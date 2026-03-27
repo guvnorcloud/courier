@@ -108,16 +108,14 @@ fn inference_loop(
     config: &IntelligenceConfig,
     model_path: &std::path::Path,
 ) {
-    use bitnet_llm::{Model, ModelParams};
+    use bitnet_llm::{Model, ModelParams, ContextParams, GenerateParams, SamplingStrategy};
 
-    let params = ModelParams {
-        n_ctx: 2048,
-        n_threads: 2,
-        ..Default::default()
-    };
+    // Initialize the ggml backend (must be called once before Model::load)
+    bitnet_llm::init();
+    bitnet_llm::suppress_warnings();
 
-    // Load the model
-    let model = match Model::load(model_path, params) {
+    // Load the model — ModelParams controls GPU offload and memory mapping
+    let model = match Model::load(model_path, ModelParams::default()) {
         Ok(m) => {
             info!("BitNet model loaded successfully");
             m
@@ -128,11 +126,21 @@ fn inference_loop(
         }
     };
 
-    let max_tokens = config.max_tokens;
+    // Context params — n_batch MUST be 1 for BitNet TL kernels
+    let ctx_params = ContextParams {
+        n_ctx: 2048,
+        n_batch: 1,
+        n_threads: 2,
+    };
 
-    // Process requests
+    let gen_params = GenerateParams {
+        max_tokens: config.max_tokens,
+        sampling: SamplingStrategy::Greedy,
+    };
+
+    // Process requests — each gets a fresh session (no cross-batch state)
     while let Some(req) = rx.blocking_recv() {
-        let findings = analyze_batch(&model, max_tokens, &req, config);
+        let findings = analyze_batch(&model, &ctx_params, &gen_params, &req, config);
         let _ = req.respond.send(findings);
     }
 
@@ -157,7 +165,8 @@ fn inference_loop(
 #[cfg(feature = "intelligence")]
 fn analyze_batch(
     model: &bitnet_llm::Model,
-    max_tokens: usize,
+    ctx_params: &bitnet_llm::ContextParams,
+    gen_params: &bitnet_llm::GenerateParams,
     req: &AnalysisRequest,
     config: &IntelligenceConfig,
 ) -> Vec<Finding> {
@@ -166,12 +175,19 @@ fn analyze_batch(
     let prompt = build_prompt(&req.lines, &req.source, &config.categories);
     debug!(lines = req.lines.len(), prompt_len = prompt.len(), "Analyzing batch");
 
-    let mut session = model.session();
-    match session.generate(&prompt, max_tokens) {
+    // Create a fresh session per batch (no KV cache reuse across batches)
+    let mut session = match model.session(ctx_params.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed to create session");
+            return Vec::new();
+        }
+    };
+
+    match session.generate(&prompt, gen_params) {
         Ok(response) => {
-            let text = response.to_string();
-            debug!(response_len = text.len(), "Model response received");
-            parse_findings(&text, req, config)
+            debug!(response_len = response.len(), "Model response received");
+            parse_findings(&response, req, config)
         }
         Err(e) => {
             error!(error = %e, "Inference failed");
