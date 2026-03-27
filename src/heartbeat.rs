@@ -27,6 +27,25 @@ pub async fn deregister(config: &GuvnorConfig) {
     }
 }
 
+/// Send a final heartbeat marking the agent as offline (clean shutdown).
+pub async fn send_offline(config: &GuvnorConfig) {
+    let client = reqwest::Client::new();
+    let url = format!("{}/courier/heartbeat", config.api_url);
+    let body = serde_json::json!({
+        "agent_id": config.agent_id,
+        "token": config.token,
+        "status": "offline",
+    });
+    match client.post(&url).json(&body).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            info!("Agent marked offline");
+        }
+        _ => {
+            warn!("Failed to send offline heartbeat");
+        }
+    }
+}
+
 pub struct HeartbeatMetrics {
     pub events_sent: AtomicU64,
     pub bytes_sent: AtomicU64,

@@ -143,11 +143,14 @@ async fn main() -> anyhow::Result<()> {
         };
 
         if !should_reload {
-            // Deregister if ephemeral mode
+            // Always send a final offline heartbeat on clean shutdown
             if let Some(ref guvnor_cfg) = guvnor_cfg {
                 if guvnor_cfg.ephemeral {
                     info!("Ephemeral mode: deregistering agent");
                     heartbeat::deregister(guvnor_cfg).await;
+                } else {
+                    info!("Sending offline heartbeat");
+                    heartbeat::send_offline(guvnor_cfg).await;
                 }
             }
             info!("Courier stopped");
