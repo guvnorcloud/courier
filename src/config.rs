@@ -1,7 +1,16 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing;
+
+/// Deserialize a value, treating YAML null as the type's Default.
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuvnorConfig {
@@ -141,8 +150,9 @@ pub enum SourceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSourceConfig {
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub include: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub exclude: Vec<String>,
     #[serde(default)]
     pub read_from_beginning: bool,
