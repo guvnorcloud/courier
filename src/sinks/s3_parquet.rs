@@ -1,4 +1,4 @@
-use crate::config::SinkConfig;
+use crate::config::{OutputFormat, SinkConfig};
 use crate::sources::LogEvent;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -18,9 +18,6 @@ pub struct S3ParquetSink {
 impl S3ParquetSink {
     pub async fn new(config: SinkConfig) -> anyhow::Result<Self> {
         let s3_client = if config.write_token.is_some() {
-            // Anonymous-style client for Guvnor-hosted buckets.
-            // Uses dummy credentials — actual auth is via the guvnor:token
-            // object tag validated by the S3 bucket policy.
             let creds = aws_credential_types::Credentials::new(
                 "ANON", "ANON", None, None, "guvnor-token-auth",
             );
@@ -31,8 +28,6 @@ impl S3ParquetSink {
                 .build();
             aws_sdk_s3::Client::from_conf(s3_config)
         } else {
-            // Standard credential chain (IAM role, env vars, profile)
-            // Used for BYOB buckets where the customer provides credentials
             let aws_config = aws_config::from_env()
                 .region(aws_config::Region::new(config.region.clone()))
                 .load().await;
@@ -50,14 +45,26 @@ impl S3ParquetSink {
         ]));
         info!(
             bucket = %config.bucket,
+            format = ?config.format,
             anonymous = config.write_token.is_some(),
-            "S3 Parquet sink ready"
+            "S3 sink ready"
         );
         Ok(Self { config, s3_client, schema })
     }
 
     pub async fn write_batch(&self, events: Vec<LogEvent>) -> anyhow::Result<()> {
         if events.is_empty() { return Ok(()); }
+
+        match self.config.format {
+            OutputFormat::Duckdb => self.write_parquet(&events, Compression::ZSTD(Default::default())).await,
+            OutputFormat::Athena => self.write_parquet(&events, Compression::SNAPPY).await,
+            OutputFormat::Jsonl => self.write_jsonl(&events).await,
+        }
+    }
+
+    /// Write as Parquet — used by both DuckDB and Athena modes.
+    /// DuckDB uses zstd compression, Athena uses snappy.
+    async fn write_parquet(&self, events: &[LogEvent], compression: Compression) -> anyhow::Result<()> {
         let count = events.len();
         let timestamps: Vec<i64> = events.iter().map(|e| e.timestamp).collect();
         let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
@@ -80,38 +87,103 @@ impl S3ParquetSink {
             Arc::new(StringArray::from(fj_refs)),
         ])?;
 
-        let compression = match self.config.compression.as_str() {
-            "snappy" => Compression::SNAPPY,
-            "gzip" => Compression::GZIP(Default::default()),
-            _ => Compression::ZSTD(Default::default()),
-        };
         let props = WriterProperties::builder().set_compression(compression).build();
         let mut buf = Vec::new();
         { let mut w = ArrowWriter::try_new(&mut buf, self.schema.clone(), Some(props))?; w.write(&batch)?; w.close()?; }
 
-        let now = chrono::Utc::now();
-        let key = self.config.key_prefix
-            .replace("{date}", &now.format("%Y-%m-%d").to_string())
-            .replace("{hour}", &now.format("%H").to_string())
-            .replace("{org_id}", "default")
-            .replace("{source}", &events[0].source);
-        let full_key = format!("{}{}.parquet", key, uuid::Uuid::new_v4());
+        let key = self.build_key(events, "parquet");
+        self.upload(key, buf, "application/vnd.apache.parquet", count).await
+    }
 
+    /// Write as JSON Lines — gzip compressed, one JSON object per log line.
+    async fn write_jsonl(&self, events: &[LogEvent]) -> anyhow::Result<()> {
+        let count = events.len();
+        let mut lines = String::with_capacity(count * 256);
+        for event in events {
+            let obj = serde_json::json!({
+                "timestamp": event.timestamp,
+                "message": event.message,
+                "source": event.source,
+                "host": event.host,
+                "file": event.file,
+                "level": event.fields.get("level"),
+                "fields": event.fields,
+            });
+            lines.push_str(&serde_json::to_string(&obj).unwrap_or_default());
+            lines.push('\n');
+        }
+
+        // Gzip compress
+        let compressed = {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(lines.as_bytes())?;
+            encoder.finish()?
+        };
+
+        let key = self.build_key(events, "jsonl.gz");
+        self.upload(key, compressed, "application/x-ndjson", count).await
+    }
+
+    /// Build the S3 key with Hive-style partitions for DuckDB/Athena,
+    /// or simple path-based for JSONL.
+    fn build_key(&self, events: &[LogEvent], ext: &str) -> String {
+        let now = chrono::Utc::now();
+        let source = &events[0].source;
+
+        match self.config.format {
+            // Hive partition scheme for DuckDB predicate pushdown
+            OutputFormat::Duckdb => {
+                format!(
+                    "source={}/year={}/month={}/day={}/hour={}/{}.{}",
+                    source,
+                    now.format("%Y"),
+                    now.format("%m"),
+                    now.format("%d"),
+                    now.format("%H"),
+                    uuid::Uuid::new_v4(),
+                    ext,
+                )
+            }
+            // Athena-compatible Hive partitions (same scheme, Glue crawlers understand it)
+            OutputFormat::Athena => {
+                format!(
+                    "source={}/year={}/month={}/day={}/hour={}/{}.{}",
+                    source,
+                    now.format("%Y"),
+                    now.format("%m"),
+                    now.format("%d"),
+                    now.format("%H"),
+                    uuid::Uuid::new_v4(),
+                    ext,
+                )
+            }
+            // Simple path-based for JSONL (human-readable)
+            OutputFormat::Jsonl => {
+                let prefix = self.config.key_prefix
+                    .replace("{date}", &now.format("%Y-%m-%d").to_string())
+                    .replace("{hour}", &now.format("%H").to_string())
+                    .replace("{org_id}", "default")
+                    .replace("{source}", source);
+                format!("{}{}.{}", prefix, uuid::Uuid::new_v4(), ext)
+            }
+        }
+    }
+
+    /// Upload bytes to S3 with token tagging.
+    async fn upload(&self, key: String, body: Vec<u8>, content_type: &str, count: usize) -> anyhow::Result<()> {
         let mut req = self.s3_client.put_object()
             .bucket(&self.config.bucket)
-            .key(&full_key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(buf))
-            .content_type("application/vnd.apache.parquet");
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .content_type(content_type);
 
-        // Tag with write token for anonymous auth
         if let Some(ref token) = self.config.write_token {
             req = req.tagging(format!("guvnor:token={}", token));
         }
 
         req.send().await?;
-
-        info!(key = %full_key, events = count, "Batch uploaded");
+        info!(key = %key, events = count, "Batch uploaded");
         Ok(())
     }
 }
-

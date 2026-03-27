@@ -172,6 +172,22 @@ pub struct MaskRule {
     pub fields: Vec<String>,
 }
 
+/// Output format — controls file format, partitioning, and compression
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    /// Parquet with Hive partitions, zstd compression (DuckDB-optimized)
+    Duckdb,
+    /// Parquet with Hive partitions, snappy compression (Athena/Glue compatible)
+    Athena,
+    /// JSON Lines, gzip compression (universal text format)
+    Jsonl,
+}
+
+impl Default for OutputFormat {
+    fn default() -> Self { Self::Duckdb }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub bucket: String,
@@ -186,6 +202,9 @@ pub struct SinkConfig {
     /// Write token for anonymous S3 puts (Guvnor-hosted buckets)
     #[serde(default)]
     pub write_token: Option<String>,
+    /// Output format: duckdb (default), athena, or jsonl
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
