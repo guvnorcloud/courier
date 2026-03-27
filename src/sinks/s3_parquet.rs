@@ -17,22 +17,15 @@ pub struct S3ParquetSink {
 
 impl S3ParquetSink {
     pub async fn new(config: SinkConfig) -> anyhow::Result<Self> {
-        let s3_client = if config.write_token.is_some() {
-            let creds = aws_credential_types::Credentials::new(
-                "ANON", "ANON", None, None, "guvnor-token-auth",
-            );
-            let s3_config = aws_sdk_s3::Config::builder()
-                .region(aws_sdk_s3::config::Region::new(config.region.clone()))
-                .credentials_provider(creds)
-                .behavior_version_latest()
-                .build();
-            aws_sdk_s3::Client::from_conf(s3_config)
-        } else {
-            let aws_config = aws_config::from_env()
-                .region(aws_config::Region::new(config.region.clone()))
-                .load().await;
-            aws_sdk_s3::Client::new(&aws_config)
-        };
+        // Always use the standard credential chain (instance role, env vars,
+        // IMDS, ~/.aws/credentials). For Guvnor-hosted buckets, the bucket
+        // policy additionally validates the guvnor:token object tag as defense
+        // in depth. The token-gated approach still works — it just requires
+        // the caller to be a valid AWS principal (not truly anonymous).
+        let aws_config = aws_config::from_env()
+            .region(aws_config::Region::new(config.region.clone()))
+            .load().await;
+        let s3_client = aws_sdk_s3::Client::new(&aws_config);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Int64, false),
