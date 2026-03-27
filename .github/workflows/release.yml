@@ -50,10 +50,12 @@ jobs:
 
       - name: Build release binary (with intelligence)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
+        id: smart_build
         run: cargo build --release --features intelligence --target ${{ matrix.target }}
 
       - name: Package intelligence binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && steps.smart_build.outcome == 'success'
         run: |
           cp target/${{ matrix.target }}/release/courier ${{ matrix.artifact }}-smart
           chmod +x ${{ matrix.artifact }}-smart
