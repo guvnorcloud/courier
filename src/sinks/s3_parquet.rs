@@ -1,4 +1,5 @@
 use crate::config::{OutputFormat, SinkConfig};
+use crate::heartbeat::S3CredentialsHolder;
 use crate::sources::LogEvent;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -7,25 +8,20 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct S3ParquetSink {
     config: SinkConfig,
-    s3_client: aws_sdk_s3::Client,
+    region: String,
     schema: Arc<Schema>,
+    /// Shared credentials holder — updated by the heartbeat loop.
+    /// If Some, use vended creds. If None, use default credential chain.
+    s3_creds: Option<S3CredentialsHolder>,
 }
 
 impl S3ParquetSink {
-    pub async fn new(config: SinkConfig) -> anyhow::Result<Self> {
-        // Always use the standard credential chain (instance role, env vars,
-        // IMDS, ~/.aws/credentials). For Guvnor-hosted buckets, the bucket
-        // policy additionally validates the guvnor:token object tag as defense
-        // in depth. The token-gated approach still works — it just requires
-        // the caller to be a valid AWS principal (not truly anonymous).
-        let aws_config = aws_config::from_env()
-            .region(aws_config::Region::new(config.region.clone()))
-            .load().await;
-        let s3_client = aws_sdk_s3::Client::new(&aws_config);
+    pub async fn new(config: SinkConfig, s3_creds: Option<S3CredentialsHolder>) -> anyhow::Result<Self> {
+        let region = config.region.clone();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Int64, false),
@@ -39,10 +35,39 @@ impl S3ParquetSink {
         info!(
             bucket = %config.bucket,
             format = ?config.format,
-            anonymous = config.write_token.is_some(),
+            vended_creds = s3_creds.is_some(),
             "S3 sink ready"
         );
-        Ok(Self { config, s3_client, schema })
+        Ok(Self { config, region, schema, s3_creds })
+    }
+
+    /// Build an S3 client using vended credentials if available,
+    /// or fall back to the default credential chain.
+    async fn get_client(&self) -> aws_sdk_s3::Client {
+        if let Some(ref holder) = self.s3_creds {
+            let guard = holder.read().await;
+            if let Some(ref creds) = *guard {
+                let credentials = aws_credential_types::Credentials::new(
+                    &creds.access_key_id,
+                    &creds.secret_access_key,
+                    Some(creds.session_token.clone()),
+                    None,
+                    "guvnor-heartbeat-vended",
+                );
+                let s3_config = aws_sdk_s3::Config::builder()
+                    .region(aws_sdk_s3::config::Region::new(self.region.clone()))
+                    .credentials_provider(credentials)
+                    .behavior_version_latest()
+                    .build();
+                return aws_sdk_s3::Client::from_conf(s3_config);
+            }
+            warn!("No vended credentials yet — waiting for first heartbeat");
+        }
+        // Fallback: default credential chain
+        let aws_config = aws_config::from_env()
+            .region(aws_config::Region::new(self.region.clone()))
+            .load().await;
+        aws_sdk_s3::Client::new(&aws_config)
     }
 
     pub async fn write_batch(&self, events: Vec<LogEvent>) -> anyhow::Result<()> {
@@ -165,7 +190,8 @@ impl S3ParquetSink {
 
     /// Upload bytes to S3 with token tagging.
     async fn upload(&self, key: String, body: Vec<u8>, content_type: &str, count: usize) -> anyhow::Result<()> {
-        let mut req = self.s3_client.put_object()
+        let client = self.get_client().await;
+        let mut req = client.put_object()
             .bucket(&self.config.bucket)
             .key(&key)
             .body(aws_sdk_s3::primitives::ByteStream::from(body))

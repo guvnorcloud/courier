@@ -46,10 +46,22 @@ pub async fn send_offline(config: &GuvnorConfig) {
     }
 }
 
+/// S3 credentials vended by the heartbeat for Guvnor-hosted buckets.
+#[derive(Debug, Clone)]
+pub struct S3Credentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+    pub expiration: String,
+}
+
 pub struct HeartbeatMetrics {
     pub events_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
 }
+
+/// Shared state for S3 credentials vended by the heartbeat.
+pub type S3CredentialsHolder = Arc<tokio::sync::RwLock<Option<S3Credentials>>>;
 
 impl HeartbeatMetrics {
     pub fn new() -> Arc<Self> {
@@ -60,21 +72,24 @@ impl HeartbeatMetrics {
     }
 }
 
-/// Start the heartbeat loop. Returns a join handle and a watch receiver
-/// that signals `true` when the backend reports config_updated.
+/// Start the heartbeat loop. Returns a join handle, a watch receiver
+/// for config_updated, and a shared holder for S3 credentials.
 pub async fn start_heartbeat(
     guvnor: GuvnorConfig,
     metrics: Arc<HeartbeatMetrics>,
     start_time: std::time::Instant,
     discovery: Option<HostDiscovery>,
-) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
+) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>, S3CredentialsHolder) {
+    let s3_creds: S3CredentialsHolder = Arc::new(tokio::sync::RwLock::new(None));
     let (config_tx, config_rx) = watch::channel(false);
 
+    let s3_creds_clone = s3_creds.clone();
     let handle = tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut tick = interval(Duration::from_secs(30));
         let mut first_beat = true;
         let discovery_data = discovery;
+        let s3_creds = s3_creds_clone;
 
         loop {
             tick.tick().await;
@@ -126,6 +141,23 @@ pub async fn start_heartbeat(
                             {
                                 first_beat = true;
                             }
+                            // Parse vended S3 credentials
+                            if let Some(creds) = data.get("s3_credentials") {
+                                if let (Some(ak), Some(sk), Some(st)) = (
+                                    creds.get("access_key_id").and_then(|v| v.as_str()),
+                                    creds.get("secret_access_key").and_then(|v| v.as_str()),
+                                    creds.get("session_token").and_then(|v| v.as_str()),
+                                ) {
+                                    let new_creds = S3Credentials {
+                                        access_key_id: ak.to_string(),
+                                        secret_access_key: sk.to_string(),
+                                        session_token: st.to_string(),
+                                        expiration: creds.get("expiration").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                    };
+                                    *s3_creds.write().await = Some(new_creds);
+                                    debug!("S3 credentials updated from heartbeat");
+                                }
+                            }
                         }
                         debug!("Heartbeat sent");
                     } else {
@@ -137,5 +169,5 @@ pub async fn start_heartbeat(
         }
     });
 
-    (handle, config_rx)
+    (handle, config_rx, s3_creds)
 }
