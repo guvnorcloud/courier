@@ -183,6 +183,9 @@ pub struct SinkConfig {
     pub compression: String,
     #[serde(default)]
     pub batch: BatchConfig,
+    /// Write token for anonymous S3 puts (Guvnor-hosted buckets)
+    #[serde(default)]
+    pub write_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

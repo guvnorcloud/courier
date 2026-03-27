@@ -17,10 +17,28 @@ pub struct S3ParquetSink {
 
 impl S3ParquetSink {
     pub async fn new(config: SinkConfig) -> anyhow::Result<Self> {
-        let aws_config = aws_config::from_env()
-            .region(aws_config::Region::new(config.region.clone()))
-            .load().await;
-        let s3_client = aws_sdk_s3::Client::new(&aws_config);
+        let s3_client = if config.write_token.is_some() {
+            // Anonymous-style client for Guvnor-hosted buckets.
+            // Uses dummy credentials — actual auth is via the guvnor:token
+            // object tag validated by the S3 bucket policy.
+            let creds = aws_credential_types::Credentials::new(
+                "ANON", "ANON", None, None, "guvnor-token-auth",
+            );
+            let s3_config = aws_sdk_s3::Config::builder()
+                .region(aws_sdk_s3::config::Region::new(config.region.clone()))
+                .credentials_provider(creds)
+                .behavior_version_latest()
+                .build();
+            aws_sdk_s3::Client::from_conf(s3_config)
+        } else {
+            // Standard credential chain (IAM role, env vars, profile)
+            // Used for BYOB buckets where the customer provides credentials
+            let aws_config = aws_config::from_env()
+                .region(aws_config::Region::new(config.region.clone()))
+                .load().await;
+            aws_sdk_s3::Client::new(&aws_config)
+        };
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Int64, false),
             Field::new("message", DataType::Utf8, false),
@@ -30,7 +48,11 @@ impl S3ParquetSink {
             Field::new("level", DataType::Utf8, true),
             Field::new("fields_json", DataType::Utf8, true),
         ]));
-        info!(bucket = %config.bucket, "S3 Parquet sink ready");
+        info!(
+            bucket = %config.bucket,
+            anonymous = config.write_token.is_some(),
+            "S3 Parquet sink ready"
+        );
         Ok(Self { config, s3_client, schema })
     }
 
@@ -75,13 +97,21 @@ impl S3ParquetSink {
             .replace("{source}", &events[0].source);
         let full_key = format!("{}{}.parquet", key, uuid::Uuid::new_v4());
 
-        self.s3_client.put_object()
-            .bucket(&self.config.bucket).key(&full_key)
+        let mut req = self.s3_client.put_object()
+            .bucket(&self.config.bucket)
+            .key(&full_key)
             .body(aws_sdk_s3::primitives::ByteStream::from(buf))
-            .content_type("application/vnd.apache.parquet")
-            .send().await?;
+            .content_type("application/vnd.apache.parquet");
+
+        // Tag with write token for anonymous auth
+        if let Some(ref token) = self.config.write_token {
+            req = req.tagging(format!("guvnor:token={}", token));
+        }
+
+        req.send().await?;
 
         info!(key = %full_key, events = count, "Batch uploaded");
         Ok(())
     }
 }
+
