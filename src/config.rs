@@ -227,7 +227,7 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
 
 pub async fn load_remote(api_url: &str, token: &str, agent_id: &str) -> anyhow::Result<Config> {
     let url = format!(
-        "{}/api/v1/courier/bootstrap/{}?hostname={}&agent_id={}",
+        "{}/courier/bootstrap/{}?hostname={}&agent_id={}",
         api_url,
         token,
         gethostname::gethostname().to_string_lossy(),

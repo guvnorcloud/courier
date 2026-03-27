@@ -150,7 +150,7 @@ async fn process_batch(
 }
 
 async fn report_findings(api_url: &str, agent_id: &str, token: &str, findings: &[Finding]) {
-    let url = format!("{}/api/v1/courier/agents/{}/findings", api_url, agent_id);
+    let url = format!("{}/courier/agents/{}/findings", api_url, agent_id);
     let client = reqwest::Client::new();
     match client
         .post(&url)

@@ -82,7 +82,7 @@ pub async fn start_heartbeat(
             }
 
             match client
-                .post(format!("{}/api/v1/courier/heartbeat", guvnor.api_url))
+                .post(format!("{}/courier/heartbeat", guvnor.api_url))
                 .json(&body)
                 .timeout(Duration::from_secs(10))
                 .send()
