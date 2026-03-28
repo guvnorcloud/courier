@@ -14,7 +14,7 @@ mod state;
 mod transforms;
 
 #[derive(Parser)]
-#[command(name = "courier", about = "Guvnor Cloud log courier agent")]
+#[command(name = "courier", version, about = "Guvnor Cloud log courier agent")]
 struct Cli {
     #[arg(short, long, default_value = "/etc/courier/courier.yaml")]
     config: PathBuf,
