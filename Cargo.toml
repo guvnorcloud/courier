@@ -1,6 +1,6 @@
 [package]
 name = "courier"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Guvnor Cloud log courier — lightweight agent for log collection, transform, and S3 delivery"
 

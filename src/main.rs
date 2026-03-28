@@ -35,11 +35,34 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     info!(version = env!("CARGO_PKG_VERSION"), "Courier starting");
 
-    let cfg = config::load(&cli.config)?;
+    let disk_cfg = config::load(&cli.config)?;
     if cli.validate {
         info!("Configuration is valid");
         return Ok(());
     }
+
+    // Always fetch fresh config from server on startup (disk config may be stale)
+    let cfg = if let Some(ref guvnor) = disk_cfg.guvnor {
+        info!("Fetching latest config from server...");
+        match config::load_remote(&guvnor.api_url, &guvnor.token, &guvnor.agent_id).await {
+            Ok(fresh_cfg) => {
+                // Persist to disk so next cold start is closer to current
+                if let Ok(yaml) = serde_yaml::to_string(&fresh_cfg) {
+                    if let Err(e) = std::fs::write(&cli.config, &yaml) {
+                        warn!(error = %e, "Failed to save fresh config to disk");
+                    }
+                }
+                info!("Started with fresh server config");
+                fresh_cfg
+            }
+            Err(e) => {
+                warn!(error = %e, "Server unreachable — falling back to disk config");
+                disk_cfg
+            }
+        }
+    } else {
+        disk_cfg
+    };
 
     // Run host discovery and start heartbeat if Guvnor config is present
     let metrics = heartbeat::HeartbeatMetrics::new();
