@@ -1,6 +1,7 @@
-use crate::config::Config;
+use crate::config::{Config, SinkType};
 use crate::heartbeat::HeartbeatMetrics;
 use crate::sinks::s3_parquet::CredentialsHolder;
+use crate::sinks::http::{HttpSink, HttpSinkConfig};
 use crate::intelligence::analyzer::AnalyzerHandle;
 use crate::sources::{self, LogEvent};
 use crate::transforms;
@@ -12,6 +13,20 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::time::{interval, Duration};
 use tracing::{info, error, debug};
+
+enum Sink {
+    S3(S3ParquetSink),
+    Http(HttpSink),
+}
+
+impl Sink {
+    async fn write_batch(&self, events: Vec<LogEvent>) -> anyhow::Result<()> {
+        match self {
+            Sink::S3(s) => s.write_batch(events).await,
+            Sink::Http(h) => h.write_batch(events).await,
+        }
+    }
+}
 
 pub struct Pipeline {
     config: Config,
@@ -71,8 +86,30 @@ impl Pipeline {
         }
 
         let _handles = sources::start_sources(&self.config.sources, tx, &self.state).await?;
-        let creds = self.s3_creds.clone().unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None)));
-        let sink = S3ParquetSink::new(self.config.sink.clone(), creds).await?;
+        let sink = match self.config.sink.sink_type {
+            SinkType::Http => {
+                let endpoint = self.config.sink.endpoint.clone()
+                    .unwrap_or_else(|| {
+                        // Derive from guvnor API URL if not set
+                        let base = self.config.guvnor.as_ref()
+                            .map(|g| g.api_url.trim_end_matches('/').to_string())
+                            .unwrap_or_default();
+                        format!("{}/api/v1/courier/logs/ingest", base)
+                    });
+                let token = self.config.guvnor.as_ref()
+                    .map(|g| g.token.clone())
+                    .unwrap_or_default();
+                let agent_id = self.config.guvnor.as_ref()
+                    .map(|g| g.agent_id.clone())
+                    .unwrap_or_default();
+                info!(endpoint = %endpoint, "Using HTTP sink");
+                Sink::Http(HttpSink::new(HttpSinkConfig { endpoint, token, agent_id }))
+            }
+            SinkType::S3 => {
+                let creds = self.s3_creds.clone().unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None)));
+                Sink::S3(S3ParquetSink::new(self.config.sink.clone(), creds).await?)
+            }
+        };
         let mut batch: Vec<LogEvent> = Vec::with_capacity(self.config.sink.batch.max_events);
         let mut batch_bytes: usize = 0;
         let batch_cfg = self.config.sink.batch.clone();
@@ -147,7 +184,7 @@ impl Pipeline {
 }
 
 async fn flush(
-    sink: &S3ParquetSink,
+    sink: &Sink,
     batch: &mut Vec<LogEvent>,
     bytes: &mut usize,
     metrics: &Arc<HeartbeatMetrics>,

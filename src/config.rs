@@ -198,8 +198,23 @@ impl Default for OutputFormat {
     fn default() -> Self { Self::Duckdb }
 }
 
+/// Sink type selector — "s3" (default) or "http"
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SinkType {
+    #[default]
+    S3,
+    Http,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
+    /// Sink type: "s3" (default, direct to S3) or "http" (POST to ingest API)
+    #[serde(default, rename = "type")]
+    pub sink_type: SinkType,
+
+    // ── S3 fields (used when sink_type = s3) ──
+    #[serde(default)]
     pub bucket: String,
     #[serde(default = "default_prefix")]
     pub key_prefix: String,
@@ -207,14 +222,21 @@ pub struct SinkConfig {
     pub region: String,
     #[serde(default = "default_compression")]
     pub compression: String,
-    #[serde(default)]
-    pub batch: BatchConfig,
     /// Write token for anonymous S3 puts (Guvnor-hosted buckets)
     #[serde(default)]
     pub write_token: Option<String>,
     /// Output format: duckdb (default), athena, or jsonl
     #[serde(default)]
     pub format: OutputFormat,
+
+    // ── HTTP fields (used when sink_type = http) ──
+    /// Ingest API endpoint URL
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    // ── Shared ──
+    #[serde(default)]
+    pub batch: BatchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
