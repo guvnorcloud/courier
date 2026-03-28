@@ -1,5 +1,4 @@
 use crate::config::{OutputFormat, SinkConfig};
-use crate::heartbeat::S3CredentialsHolder;
 use crate::sources::LogEvent;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -8,20 +7,30 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{info, error};
 
 pub struct S3ParquetSink {
     config: SinkConfig,
-    region: String,
     schema: Arc<Schema>,
-    /// Shared credentials holder — updated by the heartbeat loop.
-    /// If Some, use vended creds. If None, use default credential chain.
-    s3_creds: Option<S3CredentialsHolder>,
+    /// For token-gated writes: raw HTTP client (no AWS signature)
+    http_client: reqwest::Client,
+    /// For BYOB: AWS SDK client with credential chain
+    aws_client: Option<aws_sdk_s3::Client>,
 }
 
 impl S3ParquetSink {
-    pub async fn new(config: SinkConfig, s3_creds: Option<S3CredentialsHolder>) -> anyhow::Result<Self> {
-        let region = config.region.clone();
+    pub async fn new(config: SinkConfig) -> anyhow::Result<Self> {
+        let http_client = reqwest::Client::new();
+
+        // Only create AWS SDK client if NOT using token-gated writes
+        let aws_client = if config.write_token.is_none() {
+            let aws_config = aws_config::from_env()
+                .region(aws_config::Region::new(config.region.clone()))
+                .load().await;
+            Some(aws_sdk_s3::Client::new(&aws_config))
+        } else {
+            None
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Int64, false),
@@ -35,39 +44,10 @@ impl S3ParquetSink {
         info!(
             bucket = %config.bucket,
             format = ?config.format,
-            vended_creds = s3_creds.is_some(),
+            token_auth = config.write_token.is_some(),
             "S3 sink ready"
         );
-        Ok(Self { config, region, schema, s3_creds })
-    }
-
-    /// Build an S3 client using vended credentials if available,
-    /// or fall back to the default credential chain.
-    async fn get_client(&self) -> aws_sdk_s3::Client {
-        if let Some(ref holder) = self.s3_creds {
-            let guard = holder.read().await;
-            if let Some(ref creds) = *guard {
-                let credentials = aws_credential_types::Credentials::new(
-                    &creds.access_key_id,
-                    &creds.secret_access_key,
-                    Some(creds.session_token.clone()),
-                    None,
-                    "guvnor-heartbeat-vended",
-                );
-                let s3_config = aws_sdk_s3::Config::builder()
-                    .region(aws_sdk_s3::config::Region::new(self.region.clone()))
-                    .credentials_provider(credentials)
-                    .behavior_version_latest()
-                    .build();
-                return aws_sdk_s3::Client::from_conf(s3_config);
-            }
-            warn!("No vended credentials yet — waiting for first heartbeat");
-        }
-        // Fallback: default credential chain
-        let aws_config = aws_config::from_env()
-            .region(aws_config::Region::new(self.region.clone()))
-            .load().await;
-        aws_sdk_s3::Client::new(&aws_config)
+        Ok(Self { config, schema, http_client, aws_client })
     }
 
     pub async fn write_batch(&self, events: Vec<LogEvent>) -> anyhow::Result<()> {
@@ -80,8 +60,6 @@ impl S3ParquetSink {
         }
     }
 
-    /// Write as Parquet — used by both DuckDB and Athena modes.
-    /// DuckDB uses zstd compression, Athena uses snappy.
     async fn write_parquet(&self, events: &[LogEvent], compression: Compression) -> anyhow::Result<()> {
         let count = events.len();
         let timestamps: Vec<i64> = events.iter().map(|e| e.timestamp).collect();
@@ -113,7 +91,6 @@ impl S3ParquetSink {
         self.upload(key, buf, "application/vnd.apache.parquet", count).await
     }
 
-    /// Write as JSON Lines — gzip compressed, one JSON object per log line.
     async fn write_jsonl(&self, events: &[LogEvent]) -> anyhow::Result<()> {
         let count = events.len();
         let mut lines = String::with_capacity(count * 256);
@@ -131,7 +108,6 @@ impl S3ParquetSink {
             lines.push('\n');
         }
 
-        // Gzip compress
         let compressed = {
             use std::io::Write;
             let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -143,15 +119,12 @@ impl S3ParquetSink {
         self.upload(key, compressed, "application/x-ndjson", count).await
     }
 
-    /// Build the S3 key with Hive-style partitions for DuckDB/Athena,
-    /// or simple path-based for JSONL.
     fn build_key(&self, events: &[LogEvent], ext: &str) -> String {
         let now = chrono::Utc::now();
         let source = &events[0].source;
 
         match self.config.format {
-            // Hive partition scheme for DuckDB predicate pushdown
-            OutputFormat::Duckdb => {
+            OutputFormat::Duckdb | OutputFormat::Athena => {
                 format!(
                     "source={}/year={}/month={}/day={}/hour={}/{}.{}",
                     source,
@@ -163,20 +136,6 @@ impl S3ParquetSink {
                     ext,
                 )
             }
-            // Athena-compatible Hive partitions (same scheme, Glue crawlers understand it)
-            OutputFormat::Athena => {
-                format!(
-                    "source={}/year={}/month={}/day={}/hour={}/{}.{}",
-                    source,
-                    now.format("%Y"),
-                    now.format("%m"),
-                    now.format("%d"),
-                    now.format("%H"),
-                    uuid::Uuid::new_v4(),
-                    ext,
-                )
-            }
-            // Simple path-based for JSONL (human-readable)
             OutputFormat::Jsonl => {
                 let prefix = self.config.key_prefix
                     .replace("{date}", &now.format("%Y-%m-%d").to_string())
@@ -188,20 +147,45 @@ impl S3ParquetSink {
         }
     }
 
-    /// Upload bytes to S3 with token tagging.
+    /// Upload bytes to S3.
+    /// Token-gated: raw unsigned HTTP PUT (no AWS credentials needed).
+    /// BYOB: AWS SDK with standard credential chain.
     async fn upload(&self, key: String, body: Vec<u8>, content_type: &str, count: usize) -> anyhow::Result<()> {
-        let client = self.get_client().await;
-        let mut req = client.put_object()
-            .bucket(&self.config.bucket)
-            .key(&key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(body))
-            .content_type(content_type);
-
         if let Some(ref token) = self.config.write_token {
-            req = req.tagging(format!("guvnor:token={}", token));
+            // Raw HTTP PUT — no AWS signature, no credentials.
+            // S3 bucket policy allows PutObject when the x-amz-tagging header
+            // contains the correct guvnor:token value.
+            let url = format!(
+                "https://{}.s3.{}.amazonaws.com/{}",
+                self.config.bucket, self.config.region, key
+            );
+            let resp = self.http_client
+                .put(&url)
+                .header("Content-Type", content_type)
+                .header("x-amz-tagging", format!("guvnor:token={}", token))
+                .body(body)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err_body = resp.text().await.unwrap_or_default();
+                error!(status = %status, body = %err_body, "S3 upload failed");
+                anyhow::bail!("S3 upload failed: {} — {}", status, err_body);
+            }
+        } else if let Some(ref aws_client) = self.aws_client {
+            // AWS SDK with credential chain (BYOB buckets)
+            aws_client.put_object()
+                .bucket(&self.config.bucket)
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(body))
+                .content_type(content_type)
+                .send()
+                .await?;
+        } else {
+            anyhow::bail!("No S3 upload method configured — need write_token or AWS credentials");
         }
 
-        req.send().await?;
         info!(key = %key, events = count, "Batch uploaded");
         Ok(())
     }

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::heartbeat::{HeartbeatMetrics, S3CredentialsHolder};
+use crate::heartbeat::HeartbeatMetrics;
 use crate::intelligence::analyzer::AnalyzerHandle;
 use crate::sources::{self, LogEvent};
 use crate::transforms;
@@ -18,7 +18,6 @@ pub struct Pipeline {
     metrics: Arc<HeartbeatMetrics>,
     analyzer: Option<AnalyzerHandle>,
     config_reload_rx: Option<watch::Receiver<bool>>,
-    s3_creds: Option<S3CredentialsHolder>,
 }
 
 impl Pipeline {
@@ -28,12 +27,7 @@ impl Pipeline {
         metrics: Arc<HeartbeatMetrics>,
         analyzer: Option<AnalyzerHandle>,
     ) -> Self {
-        Self { config, state, metrics, analyzer, config_reload_rx: None, s3_creds: None }
-    }
-
-    pub fn with_s3_creds(mut self, creds: S3CredentialsHolder) -> Self {
-        self.s3_creds = Some(creds);
-        self
+        Self { config, state, metrics, analyzer, config_reload_rx: None }
     }
 
     pub fn with_config_reload(mut self, rx: watch::Receiver<bool>) -> Self {
@@ -70,7 +64,7 @@ impl Pipeline {
         }
 
         let _handles = sources::start_sources(&self.config.sources, tx, &self.state).await?;
-        let sink = S3ParquetSink::new(self.config.sink.clone(), self.s3_creds.clone()).await?;
+        let sink = S3ParquetSink::new(self.config.sink.clone()).await?;
         let mut batch: Vec<LogEvent> = Vec::with_capacity(self.config.sink.batch.max_events);
         let mut batch_bytes: usize = 0;
         let batch_cfg = self.config.sink.batch.clone();
