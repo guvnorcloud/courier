@@ -1,5 +1,6 @@
 use crate::config::GuvnorConfig;
 use crate::discovery::HostDiscovery;
+use crate::sinks::s3_parquet::{CredentialsHolder, VendedCredentials};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -60,21 +61,24 @@ impl HeartbeatMetrics {
     }
 }
 
-/// Start the heartbeat loop. Returns a join handle and a watch receiver
-/// that signals `true` when the backend reports config_updated.
+/// Start the heartbeat loop. Returns a join handle, a watch receiver
+/// for config_updated, and a shared holder for vended S3 credentials.
 pub async fn start_heartbeat(
     guvnor: GuvnorConfig,
     metrics: Arc<HeartbeatMetrics>,
     start_time: std::time::Instant,
     discovery: Option<HostDiscovery>,
-) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
+) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>, CredentialsHolder) {
+    let s3_creds: CredentialsHolder = Arc::new(tokio::sync::RwLock::new(None));
     let (config_tx, config_rx) = watch::channel(false);
 
+    let s3_creds_clone = s3_creds.clone();
     let handle = tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut tick = interval(Duration::from_secs(30));
         let mut first_beat = true;
         let discovery_data = discovery;
+        let s3_creds = s3_creds_clone;
 
         loop {
             tick.tick().await;
@@ -126,6 +130,21 @@ pub async fn start_heartbeat(
                             {
                                 first_beat = true;
                             }
+                            // Parse vended S3 credentials
+                            if let Some(creds) = data.get("s3_credentials") {
+                                if let (Some(ak), Some(sk), Some(st)) = (
+                                    creds.get("access_key_id").and_then(|v| v.as_str()),
+                                    creds.get("secret_access_key").and_then(|v| v.as_str()),
+                                    creds.get("session_token").and_then(|v| v.as_str()),
+                                ) {
+                                    *s3_creds.write().await = Some(VendedCredentials {
+                                        access_key_id: ak.to_string(),
+                                        secret_access_key: sk.to_string(),
+                                        session_token: st.to_string(),
+                                    });
+                                    debug!("S3 credentials updated");
+                                }
+                            }
                         }
                         debug!("Heartbeat sent");
                     } else {
@@ -137,5 +156,5 @@ pub async fn start_heartbeat(
         }
     });
 
-    (handle, config_rx)
+    (handle, config_rx, s3_creds)
 }

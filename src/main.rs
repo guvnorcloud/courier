@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let metrics = heartbeat::HeartbeatMetrics::new();
     let start_time = std::time::Instant::now();
 
-    let config_reload_rx = if let Some(guvnor_cfg) = &cfg.guvnor {
+    let hb_result = if let Some(guvnor_cfg) = &cfg.guvnor {
         let discovery_data = discovery::discover();
         info!(
             processes = discovery_data.processes.len(),
@@ -53,21 +53,22 @@ async fn main() -> anyhow::Result<()> {
             recommendations = discovery_data.recommendations.len(),
             "Host discovery complete"
         );
-        let (_hb_handle, rx) = heartbeat::start_heartbeat(
+        let (_hb_handle, rx, s3_creds) = heartbeat::start_heartbeat(
             guvnor_cfg.clone(),
             metrics.clone(),
             start_time,
             Some(discovery_data),
         ).await;
         info!(agent_id = %guvnor_cfg.agent_id, "Heartbeat started");
-        Some(rx)
+        Some((rx, s3_creds))
     } else {
         None
     };
 
     // Main config reload loop
     let mut current_cfg = cfg;
-    let mut reload_rx = config_reload_rx;
+    let mut reload_rx = hb_result.as_ref().map(|(rx, _)| rx.clone());
+    let s3_creds = hb_result.as_ref().map(|(_, c)| c.clone());
 
     loop {
         // Initialize intelligence engine for this config cycle
@@ -115,6 +116,10 @@ async fn main() -> anyhow::Result<()> {
             metrics.clone(),
             analyzer,
         );
+
+        if let Some(ref creds) = s3_creds {
+            pipeline = pipeline.with_s3_creds(creds.clone());
+        }
 
         if let Some(rx) = reload_rx.take() {
             pipeline = pipeline.with_config_reload(rx.clone());
